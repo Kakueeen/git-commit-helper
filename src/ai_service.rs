@@ -719,9 +719,7 @@ impl AiService for QwenTranslator {
 
 pub async fn create_translator(config: &Config) -> anyhow::Result<Box<dyn Translator>> {
     info!("创建 {:?} AI服务", config.default_service);
-    let service_config = config.services.iter()
-        .find(|s| s.service == config.default_service)
-        .ok_or_else(|| anyhow::anyhow!("找不到默认服务的配置"))?;
+    let service_config = config.get_default_service()?;
     create_translator_for_service(service_config).await
 }
 
@@ -733,11 +731,14 @@ pub async fn translate_with_fallback(config: &Config, text: &str) -> anyhow::Res
         return Ok(text.trim().to_string());
     }
 
-    debug!("尝试使用默认服务 {:?}", config.default_service);
-    if let Some(result) = try_translate(&config.default_service, config, text).await {
-        return result;
+    // 获取默认服务配置并尝试翻译
+    if let Ok(default_service_config) = config.get_default_service() {
+        debug!("尝试使用默认服务 {:?}", default_service_config.service);
+        if let Some(result) = try_translate(&default_service_config.service, config, text).await {
+            return result;
+        }
+        tried_services.push(default_service_config.service.clone());
     }
-    tried_services.push(config.default_service.clone());
 
     for service_config in &config.services {
         if tried_services.contains(&service_config.service) {

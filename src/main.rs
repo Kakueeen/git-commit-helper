@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use dialoguer::{Confirm, Select, Input};
+use dialoguer::{Confirm, Input};
 use log::debug;
 use std::path::PathBuf;
 use crate::config::AIService;
@@ -315,8 +315,25 @@ async fn main() -> Result<()> {
                 ServiceCommands::List => {
                     let config = config::Config::load()?;
                     println!("{}", Style::title("已配置的 AI 服务列表:"));
+                    if config.services.is_empty() {
+                        println!("{}", Style::plain("  暂无配置的 AI 服务"));
+                        return Ok(());
+                    }
+
                     for (i, service) in config.services.iter().enumerate() {
-                        println!("{}", Style::plain(&format!("[{}] {:?}{}", i + 1, service.service, if service.service == config.default_service { " (默认)" } else { "" })));
+                        let default_marker = if config.is_default_service(service) { " (当前默认)" } else { "" };
+                        print!("{}", Style::plain(&format!("[{}] {:?}{}", i + 1, service.service, default_marker)));
+
+                        // 显示URL信息
+                        match &service.api_endpoint {
+                            Some(url) => print!("{}", Style::plain(&format!("    URL: {}", url))),
+                            None => println!("{}", Style::plain("    URL: (使用默认)")),
+                        }
+
+                        // 显示模型信息（如果有）
+                        if let Some(model) = &service.model {
+                            println!("{}", Style::plain(&format!("    模型: {}", model)));
+                        }
                     }
                     Ok(())
                 }
@@ -326,23 +343,39 @@ async fn main() -> Result<()> {
                         return Err(anyhow::anyhow!("没有配置任何 AI 服务，请先添加服务"));
                     }
 
-                    let service_names: Vec<String> = config.services
-                        .iter()
-                        .enumerate()
-                        .map(|(i, s)| format!("[{}] {:?}{}",
-                            i + 1,
-                            s.service,
-                            if s.service == config.default_service { " (默认)" } else { "" }
-                        ))
-                        .collect();
+                    println!("{}", Style::title("请选择要测试的 AI 服务:"));
 
-                    let selection = Select::new()
-                        .with_prompt("请选择要测试的 AI 服务")
-                        .items(&service_names)
-                        .default(0)
-                        .interact()?;
+                    // 显示所有服务的详细信息
+                    for (i, service) in config.services.iter().enumerate() {
+                        let default_marker = if config.is_default_service(service) { " (当前默认)" } else { "" };
+                        print!("{}", Style::plain(&format!("[{}] {:?}{}", i + 1, service.service, default_marker)));
 
-                    let service = &config.services[selection];
+                        // 显示URL信息
+                        match &service.api_endpoint {
+                            Some(url) => print!("{}", Style::plain(&format!("    URL: {}", url))),
+                            None => println!("{}", Style::plain("    URL: (使用默认)")),
+                        }
+
+                        // 显示模型信息（如果有）
+                        if let Some(model) = &service.model {
+                            println!("{}", Style::plain(&format!("    模型: {}", model)));
+                        }
+                    }
+
+                    // 让用户选择服务
+                    let services_len = config.services.len();
+                    let selection = Input::<String>::new()
+                        .with_prompt("请输入要测试的服务编号")
+                        .validate_with(|input: &String| -> Result<(), &str> {
+                            match input.parse::<usize>() {
+                                Ok(n) if n >= 1 && n <= services_len => Ok(()),
+                                _ => Err("输入的数字超出范围")
+                            }
+                        })
+                        .interact()?
+                        .parse::<usize>()?;
+
+                    let service = &config.services[selection - 1];
                     println!("{}", Style::title(&format!("正在测试 {:?} 服务...", service.service)));
 
                     let translator = ai_service::create_translator_for_service(service).await?;

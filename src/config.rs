@@ -12,6 +12,10 @@ use crate::ai_service;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Config {
+    #[serde(default)]
+    pub default_service_id: String,  // 改为使用服务ID
+    // 保留原字段以确保向后兼容性
+    #[serde(default = "default_service_type")]
     pub default_service: AIService,
     pub services: Vec<AIServiceConfig>,
     #[serde(default = "default_ai_review")]
@@ -37,6 +41,11 @@ fn default_only_english() -> bool {
     false
 }
 
+// 默认服务类型，用于向后兼容
+fn default_service_type() -> AIService {
+    AIService::OpenAI
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct GerritConfig {
     pub username: Option<String>,
@@ -54,6 +63,20 @@ fn default_timeout() -> u64 {
     20
 }
 
+// 生成唯一服务ID的函数
+fn generate_service_id() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    let counter = COUNTER.fetch_add(1, Ordering::SeqCst);
+    format!("service_{}_{}", timestamp, counter)
+}
+
 // 添加响应的最大token
 fn default_max_tokens() -> u64 {
     2048
@@ -65,6 +88,8 @@ pub struct AIServiceConfig {
     pub api_key: String,
     pub api_endpoint: Option<String>,
     pub model: Option<String>,  // 新增字段
+    #[serde(default = "generate_service_id")]
+    pub id: String,  // 新增唯一标识符
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
@@ -81,6 +106,7 @@ pub enum AIService {
 impl Config {
     pub fn new() -> Self {
         Self {
+            default_service_id: String::new(),
             default_service: AIService::OpenAI, // Changed from ChatGPT
             services: Vec::new(),
             ai_review: true,  // 默认开启
@@ -101,14 +127,31 @@ impl Config {
             return Err(anyhow::anyhow!("配置文件不存在，请先运行 'git-commit-helper config' 进行配置"));
         }
 
-        let config_str = fs::read_to_string(&config_path)
-            .context("读取配置文件失败")?;
-        let config: Config = serde_json::from_str(&config_str)
-            .context("解析配置文件失败")?;
+        let content = fs::read_to_string(&config_path)
+            .with_context(|| format!("无法读取配置文件: {}", config_path.display()))?;
+
+        let mut config: Config = serde_json::from_str(&content)
+            .with_context(|| format!("配置文件格式错误: {}", config_path.display()))?;
+
+        // 确保所有服务都有ID，为向后兼容性
+        config.ensure_service_ids();
 
         info!("已加载配置，使用 {:?} 服务", config.default_service);
-
         Ok(config)
+    }
+
+    // 确保所有服务都有唯一ID
+    fn ensure_service_ids(&mut self) {
+        for service in &mut self.services {
+            if service.id.is_empty() {
+                service.id = generate_service_id();
+            }
+        }
+
+        // 如果没有设置默认服务ID，且有服务存在，设置为第一个服务的ID
+        if self.default_service_id.is_empty() && !self.services.is_empty() {
+            self.default_service_id = self.services[0].id.clone();
+        }
     }
 
     pub async fn interactive_config() -> Result<()> {
@@ -285,6 +328,7 @@ impl Config {
             .interact()?;
 
         let mut config = Config {
+            default_service_id: services[default_index - 1].id.clone(),
             default_service: services[default_index - 1].service.clone(),
             services,
             ai_review: true,  // 默认开启
@@ -314,6 +358,7 @@ impl Config {
             println!("正在测试翻译功能...");
             // 创建一个临时的 Config 对象，确保只测试默认服务
             let test_config = Config {
+                default_service_id: config.services[default_index - 1].id.clone(),
                 default_service: config.default_service.clone(),
                 services: vec![config.services[default_index - 1].clone()],
                 ai_review: true,
@@ -437,6 +482,7 @@ impl Config {
                                         api_key: token,
                                         api_endpoint: None,
                                         model: Some(model_id),
+                                        id: generate_service_id(),
                                     }
                                 } else {
                                     // 如果没有可用模型列表，使用默认模型
@@ -445,6 +491,7 @@ impl Config {
                                         api_key: token,
                                         api_endpoint: None,
                                         model: Some("copilot-chat".to_string()),
+                                        id: generate_service_id(),
                                     }
                                 }
                             },
@@ -470,11 +517,13 @@ impl Config {
                 api_key: String::new(),
                 api_endpoint: None,
                 model: None,
+                id: generate_service_id(),
             }).await?,
         };
 
         // 添加服务
         if self.services.is_empty() {
+            self.default_service_id = config.id.clone();
             self.default_service = config.service.clone();
         }
         self.services.push(config.clone());
@@ -488,6 +537,7 @@ impl Config {
             println!("正在测试 {:?} 服务...", config.service);
             // 创建一个临时的 Config 对象，只包含要测试的新服务
             let test_config = Config {
+                default_service_id: config.id.clone(),
                 default_service: config.service.clone(),
                 services: vec![config.clone()],
                 ai_review: true,
@@ -571,7 +621,24 @@ impl Config {
 
         println!("\n已配置的 AI 服务:");
         for (i, s) in self.services.iter().enumerate() {
-            println!("{}. {:?}", i + 1, s.service);
+            let default_marker = if self.is_default_service(s) { " (当前默认)" } else { "" };
+            println!("[{}] {:?}{}", i + 1, s.service, default_marker);
+
+            // 显示URL信息
+            match &s.api_endpoint {
+                Some(url) => println!("    URL: {}", url),
+                None => println!("    URL: (使用默认)"),
+            }
+
+            // 显示模型信息（如果有）
+            if let Some(model) = &s.model {
+                println!("    模型: {}", model);
+            }
+
+            // 添加空行分隔
+            if i < self.services.len() {
+                println!();
+            }
         }
 
         let selection = Input::<String>::with_theme(&dialoguer::theme::ColorfulTheme::default())
@@ -605,7 +672,24 @@ impl Config {
 
         println!("\n已配置的 AI 服务:");
         for (i, s) in self.services.iter().enumerate() {
-            println!("{}. {:?}", i + 1, s.service);
+            let default_marker = if self.is_default_service(s) { " (当前默认)" } else { "" };
+            println!("{}. {:?}{}", i + 1, s.service, default_marker);
+
+            // 显示URL信息
+            match &s.api_endpoint {
+                Some(url) => println!("    URL: {}", url),
+                None => println!("    URL: (使用默认)"),
+            }
+
+            // 显示模型信息（如果有）
+            if let Some(model) = &s.model {
+                println!("    模型: {}", model);
+            }
+
+            // 添加空行分隔（除了最后一个）
+            if i < self.services.len() - 1 {
+                println!();
+            }
         }
 
         let services_len = self.services.len();
@@ -623,7 +707,9 @@ impl Config {
 
         let removed = self.services.remove(selection - 1);
 
-        if removed.service == self.default_service && !self.services.is_empty() {
+        // 如果删除的是默认服务，重新设置默认服务
+        if removed.id == self.default_service_id && !self.services.is_empty() {
+            self.default_service_id = self.services[0].id.clone();
             self.default_service = self.services[0].service.clone();
         }
 
@@ -639,7 +725,24 @@ impl Config {
 
         println!("\n已配置的 AI 服务:");
         for (i, s) in self.services.iter().enumerate() {
-            println!("{}. {:?}", i + 1, s.service);
+            let default_marker = if self.is_default_service(s) { " (当前默认)" } else { "" };
+            println!("{}. {:?}{}", i + 1, s.service, default_marker);
+
+            // 显示URL信息
+            match &s.api_endpoint {
+                Some(url) => println!("    URL: {}", url),
+                None => println!("    URL: (使用默认)"),
+            }
+
+            // 显示模型信息（如果有）
+            if let Some(model) = &s.model {
+                println!("    模型: {}", model);
+            }
+
+            // 添加空行分隔
+            if i < self.services.len() {
+                println!();
+            }
         }
 
         let services_len = self.services.len();
@@ -655,7 +758,9 @@ impl Config {
             .interact()?
             .parse::<usize>()?;
 
-        self.default_service = self.services[selection - 1].service.clone();
+        let selected_service = &self.services[selection - 1];
+        self.default_service_id = selected_service.id.clone();
+        self.default_service = selected_service.service.clone();  // 保持向后兼容
         self.save()?;
         info!("默认 AI 服务设置成功");
         Ok(())
@@ -668,6 +773,7 @@ impl Config {
             api_key: String::new(),
             api_endpoint: None,
             model: None,
+            id: generate_service_id(),
         }).await
     }
 
@@ -720,6 +826,7 @@ impl Config {
                                 api_key: default.api_key.clone(),
                                 api_endpoint: None,
                                 model: Some(model_id),
+                                id: default.id.clone(),  // 保持现有ID
                             });
                         }
                     },
@@ -740,6 +847,7 @@ impl Config {
                     api_key: default.api_key.clone(),  // 保留原有 token
                     api_endpoint: None,
                     model: if model.is_empty() { Some("copilot-chat".to_string()) } else { Some(model) },
+                    id: default.id.clone(),  // 保持现有ID
                 });
             } else {
                 // 如果没有 API key，直接处理 Copilot 验证，而不是递归调用
@@ -793,6 +901,7 @@ impl Config {
                                         api_key: token,
                                         api_endpoint: None,
                                         model: Some(model_id),
+                                        id: generate_service_id(),
                                     });
                                 } else {
                                     // 如果没有可用模型列表，使用默认模型
@@ -801,6 +910,7 @@ impl Config {
                                         api_key: token,
                                         api_endpoint: None,
                                         model: Some("copilot-chat".to_string()),
+                                        id: generate_service_id(),
                                     });
                                 }
                             },
@@ -864,6 +974,7 @@ impl Config {
             api_key,
             api_endpoint: if api_endpoint.is_empty() { None } else { Some(api_endpoint) },
             model: if model.is_empty() { None } else { Some(model) },
+            id: if default.id.is_empty() { generate_service_id() } else { default.id.clone() },  // 保持现有ID或生成新ID
         })
     }
 
@@ -872,13 +983,29 @@ impl Config {
             return Err(anyhow::anyhow!("没有配置任何 AI 服务"));
         }
 
-        // 查找默认服务
+        // 优先使用服务ID查找默认服务
+        if !self.default_service_id.is_empty() {
+            if let Some(service) = self.services.iter().find(|s| s.id == self.default_service_id) {
+                return Ok(service);
+            }
+        }
+
+        // 向后兼容：如果没有找到服务ID匹配，使用服务类型查找
         if let Some(service) = self.services.iter().find(|s| s.service == self.default_service) {
             return Ok(service);
         }
 
-        // 如果没有设置默认服务或默认服务不存在，返回第一个服务
+        // 如果都没找到，返回第一个服务
         Ok(&self.services[0])
+    }
+
+    // 检查指定服务是否为默认服务
+    pub fn is_default_service(&self, service: &AIServiceConfig) -> bool {
+        if !self.default_service_id.is_empty() {
+            return service.id == self.default_service_id;
+        }
+        // 向后兼容：如果没有服务ID，使用服务类型比较
+        service.service == self.default_service
     }
 
     pub fn save(&self) -> Result<()> {

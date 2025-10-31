@@ -41,10 +41,7 @@ fn parse_issue_reference(issues: &str) -> anyhow::Result<String> {
         else if link.contains("pms.uniontech.com") {
             match parse_pms_link(link) {
                 Ok(ref_str) => {
-                    // 提取 PMS: 后面的部分
-                    if let Some(pms_ref) = ref_str.strip_prefix("PMS: ") {
-                        pms_refs.push(pms_ref.to_string());
-                    }
+                    pms_refs.push(ref_str.to_string());
                 }
                 Err(e) => return Err(e),
             }
@@ -66,7 +63,7 @@ fn parse_issue_reference(issues: &str) -> anyhow::Result<String> {
     }
 
     if !pms_refs.is_empty() {
-        result.push(format!("PMS: {}", pms_refs.join(" ")));
+        result.push(format!("{}", pms_refs.join(" ")));
     }
 
     if result.is_empty() {
@@ -103,14 +100,11 @@ fn parse_pms_link(url: &str) -> anyhow::Result<String> {
     let story_regex = Regex::new(r"story-view-(\d+)\.html")?;
 
     if let Some(captures) = bug_regex.captures(url) {
-        let id = &captures[1];
-        Ok(format!("PMS: BUG-{}", id))
+        Ok(format!("BUG: {}", url.to_string()))
     } else if let Some(captures) = task_regex.captures(url) {
-        let id = &captures[1];
-        Ok(format!("PMS: TASK-{}", id))
+        Ok(format!("TASK: {}", url.to_string()))
     } else if let Some(captures) = story_regex.captures(url) {
-        let id = &captures[1];
-        Ok(format!("PMS: STORY-{}", id))
+        Ok(format!("STORY: {}", url.to_string()))
     } else {
         Err(anyhow::anyhow!("无效的 PMS 链接格式: {}", url))
     }
